@@ -1,5 +1,12 @@
-<!DOCTYPE html>
-<html>
+<!-- 
+
+This is not a Mixpanel product, nor has it gone through a formal review process.
+Please be careful making any decisions based on this report.
+
+-->
+
+
+<!doctype html>
   <head>
     <meta charset="utf-8">
     <link rel="stylesheet" type="text/css" href="https://cdn.mxpnl.com/libs/mixpanel-platform/css/reset.css">
@@ -7,44 +14,612 @@
     <script src="https://cdn.mxpnl.com/libs/mixpanel-platform/build/mixpanel-platform.v0.latest.min.js"></script>
   </head>
   <body class="mixpanel-platform-body">
-    <div class="mixpanel-platform-section">
-      <div id="eventSelect" style="float: left;"></div>
-      <div id="by" class="mixpanel-platform-label" style="margin-left: 10px; display: none;">by</div>
-      <div id="propSelect" style="float: left;"></div>
-      <div id="dateSelect" style="float: right;"></div>
-      <div style="clear: both;"></div>
-      <div id="graph"></div>
+    <style>
+      .header {
+        font-size: 20px;
+        color: #747d94;
+        font-weight: bold;
+        margin-bottom: 15px;
+        text-align: center;
+      }
+      #graph, #table {
+        margin-bottom: 15px
+      }
+      .space {
+        color: #f0f2f6;
+      }
+      .label {
+        text-align: right;
+        color: #747d94;
+        font-weight: bold;
+      }
+      .mixpanel-platform-select.event_selector_theme {
+        max-width: 53px;
+      }
+      .mixpanel-platform-select.event_selector_theme .select_button.small, .mixpanel-platform-input-select {
+        max-width: 53px;
+        min-width: 0;
+      }
+      .mixpanel-platform-select.event_selector_theme .select_button.active+.select_menu.small {
+        max-width: 96px;
+        min-width: 0;
+      }
+      #dateSelect {
+        display: inline-block;
+        right: 15px;
+        vertical-align: middle;
+      }
+      #unitSelect, #maxLengthSelect {
+        margin-left: -41px;
+      }
+    </style>
+    <script id='query'>
+    
+      //list of events to ignore in flow sequences, the below will ignore nothing
+      var badEvents = [];
+      
+      //can uncomment the line below to ignore all "passive" events
+
+      badEvents = ['$campaign_delivery', '$campaign_marked_spam', '$campaign_bounced', '$campaign_open', '$experiment_started', '$show_survey'];
+
+      //function to run in groupByUser, creates a state for each user
+      function createUserState(state, items) {
+
+        //initialize state if it doesn't exist yet
+        state = state || {sequence: []};
+
+        //function to run for each event the user has done
+        var stateUpdater = function(event) {
+
+          //if we aren't done finding a flow matching all of the parameters, run this logic
+          if (!state.done) {
+
+            //chop off all events further in the past than the conversion window away in time and all events longer than the max sequence length - 1 (leaving room for a new event to be added)
+            state.sequence = _.chain(state.sequence)
+                            .filter(item => item.time + params.conversionLength > event.time)
+                            .last(params.maxLength - 1)
+                            .value();
+
+            //add new event to sequence
+            state.sequence.push({name: event.name, time: event.time});
+
+            //if there's a property in the query params and that property exists on our current event, update the user state with that value, otherwise this does nothing
+            state.property = params.property && event.properties[params.property]?
+                            event.properties[params.property] : state.property;
+
+            //if there's a people property in the query params and that property exists on our current event/user object, update the user state with that value, otherwise this does nothing.  note, if somehow a people property and an event property both get passed in (which should not be possible in this report), the people property will "win"
+            state.property = params.peopleProp && event.properties[params.peopleProp]?
+                            event.properties[params.peopleProp] : state.property;
+
+            //if there's a start event in the query params, and it's at the beginning of the current sequence, and the sequence length is greater than or equal to the mimimum length in the params, run this
+            if (params.startEvent && params.startEvent == state.sequence[0].name && state.sequence.length >= params.minLength) {
+              
+              //make an array of only event names so that it's easy to check for certain conditions
+              var sequenceOfNamesOnly = _.pluck(state.sequence, 'name');
+
+              //but even without checking anything, if there's no end event, we're done
+              if (!params.endEvent)
+                state.done = true;
+
+              //if there is an end event, and the end event is in the sequence, we have to do some more checking
+              else if (params.endEvent && _.contains(sequenceOfNamesOnly, params.endEvent)) {
+                
+                //find the index of the end event in the sequence (if it's in there multiple times, find the last one)
+                var indexOfEndEvent = _.lastIndexOf(sequenceOfNamesOnly, params.endEvent);
+
+                //make a sequence that cuts off all events after the last end event
+                var truncatedSequence = _.first(sequenceOfNamesOnly, indexOfEndEvent + 1);
+
+                //if the truncated sequence is still long enough to satisfy the mimimum sequence length, we've found a good sequence
+                if (truncatedSequence.length >= params.minLength) {
+                  
+                  //set done to true so we don't mess with what we've found
+                  state.done = true;
+
+                  //overwrite the sequence stored in state by chopping off all of the events after the end event
+                  state.sequence = _.first(state.sequence, indexOfEndEvent + 1);
+                }
+              }
+            }
+
+            //if there's no start event in the query params and there is an end event in the query params, and the sequence is greater than or equal to the minimum length, we're done
+            else if (!params.startEvent && params.endEvent && event.name == params.endEvent && state.sequence.length >= params.minLength) {
+              state.done = true;
+            }
+          }
+        }
+
+        //this function overwrites event properties with people properties if there's a people property selector in the query params
+        var itemMapper = function(item) {
+
+          //if there's a people prop in the params, create a new object that looks like a normal event, except with people props instead of event props
+          if (params.peopleProp) {
+              //clone the event
+              var event = _.clone(item.event);
+              //if there's a profile for the user, set properties object to people properties, otherwise set it to empty object
+              event.properties = item.user? _.clone(item.user.properties) : {};
+
+              //return transformed event
+              return event;
+          }
+
+          //if there isn't a people prop in the params, do nothing
+          else
+              return item;
+        };
+
+        //map every item through the item mapper, then filter out all events in the bad_events array, then run stateUpdater on each item/event
+        _.chain(items)
+        .map(itemMapper)
+        .filter(item => !_.contains(badEvents, item.name))
+        .each(stateUpdater);
+
+        //return the state of the user after running through all the items
+        return state;
+      }
+
+      //custom reducer to run on groupings of sequence/property/count objects by property
+      function theTop(n) {
+
+          //needs to return a custom function so that we can use the value of n and also use .groupBy
+          return function(accumulators, items) {
+
+              //initialize count to 0
+              var count = 0;
+
+              //shortcut function to add to count
+              var countAdder = function(item) {count += item};
+
+              //make an array out of all of the "value" keys in the items array, then run countAdder on each value
+              _.chain(items)
+               .pluck('value')
+               .each(countAdder);
+              
+              //make an array out of all of the "count" keys in the accumulators array, then run countAdder on each value
+              _.chain(accumulators)
+               .pluck('count')
+               .each(countAdder);
+
+              //make a result variable with these rules:
+              //1. make an array of all the "results" keys in the accumulators list
+              //2. reduce it to a single array of values
+              //3. add items array
+              //4. sort by top values
+              //5. truncate to first n values in array
+              var result = _.pluck(accumulators, 'results')
+                            .reduce(function(a, b) {return a.concat(b);},[])
+                            .concat(items)
+                            .sort(function(a, b) {return b.value - a.value;})
+                            .slice(0, n);
+
+              //return object with result and count to be processed on next iteration, also returns final sorted result the last time it runs
+              return {results: result,
+                      count: count};
+          };
+      }
+
+      //map top sequences for a given property to an object that's easier to parse or transform
+      function mapToFinalResult(item) {
+
+          // get the count of users that have the given property value
+          var count = item.value.count;
+
+          // run through each sequence for the given property value
+          var results = _.map(item.value.results, function(seq) {
+              //make a new results object to store data on the sequence
+              var res = {};
+
+              //get the count of users that have the specific sequence
+              res.count = seq.value;
+
+              //calculate the percentage of users who have the specific sequence by using the count variable above
+              res.percentage = 100 * seq.value / count;
+
+              //due to a quirk of groupBy with arrays, the last item in each sequence is its corresponding property, so we're truncating that away
+              res.sequence = _.first(seq.key, seq.key.length - 1);
+
+              //return results object for specific sequence
+              return res;
+          });
+
+          //return an object with value set to the above results object, and key set to an object containing the count and property name
+          return {value: results, key: {count: count, property: item.key[0]}};
+      }
+
+      function main() {
+
+        //create query that either gets only event data or joins, depending on whether people data is necessary
+        var query = params.peopleProp?
+                      join(Events({from_date: params.fromDate, to_date: params.toDate}), People()).filter(item => item.event):
+                      Events({from_date: params.fromDate, to_date: params.toDate});
+
+        //return the query and some transformations
+        return query
+
+        //run createUserState function on all users (this will first organize all of the items above into groups based on distinct_id, then will apply the function on each item, guaranteeing time-order)
+        .groupByUser(createUserState)
+
+        //filter out all user states that don't have sequences matching the parameters of the query
+        .filter(state => state.value.done || (!params.startEvent && !params.endEvent && state.value.sequence.length >= params.minLength))
+
+        //simplify user states to a single object with a sequence key whose value is an array of event names and a property key whose value is the relevant property for the user or 'No Property' if there's no valid property
+        .map(item => ({sequence: _.pluck(item.value.sequence, 'name'),
+                      property: item.value.property? item.value.property: 'No Property'}))
+
+        //organize user states by common sequence/property combinations and count the frequency of each combination
+        .groupBy([item => item.sequence, item => item.property], mixpanel.reducer.count())
+
+        //organize the sequence/property/count objects above by their common properties, then apply custom reducer theTop to each property grouping, finding the top n results for each property, where n is params.numResults
+        .groupBy([item => item.key[item.key.length - 1]], theTop(params.numResults))
+
+        //clean up the results from above so the result is easier to manipulate
+        .map(mapToFinalResult);
+      }
+      
+    </script>
+    <div class="mixpanel-platform-section" style='width:919px'>
+    <table>
+      <tr>
+        <td colspan='6' class='header'>Most Common User Flows</td>
+      </tr>
+      <tr>
+        <td colspan='6' class="space">.</td>
+      </tr>
+      <tr>
+        <td width="199" class="label">Date range:</td>
+        <td width="25" class="space">.</td>
+        <td width="260" class="dropdown"><div id="dateSelect"></div></td>
+        <td width="160" class="label">Start Event:</td>
+        <td width="25" class="space">.</td>
+        <td width="250" class="dropdown"><div id="startEventSelect"></div></td>
+      </tr>
+      <tr>
+        <td colspan='6' class="space">.</td>
+      </tr>
+      <tr>
+        <td class="label">Conversion Window:</td>
+        <td class="space">.</td>
+        <td class="dropdown"><div id="timeSelect"></div><div id="unitSelect"></div></td>
+        <td class="label">End Event:</td>
+        <td class="space">.</td>
+        <td class="dropdown"><div id="eventSelect"></div></td>
+      </tr>
+      <tr>
+        <td colspan='6' class="space">.</td>
+      </tr>
+      <tr>
+        <td class="label">Sequence Length (min/max):</td>
+        <td class="space">.</td>
+        <td class="dropdown"><div id="minLengthSelect"></div><div id="maxLengthSelect"></div></td>
+        <td class="label">Property:</td>
+        <td class="space">.</td>
+        <td class="dropdown"><div id="propSelect"></div></td>
+      </tr>
+      <tr>
+        <td colspan='6' class="space">.</td>
+      </tr>
+      <tr>
+        <td class="label">Number of results to show:</td>
+        <td class="space">.</td>
+        <td class="dropdown" colspan='4'><div id="numResultsSelect"></div></td>
+      </tr>
+    </table>
     </div>
-    <div id="table"></div>
+    <div id="graph" style='width:943px'></div>
+    <div id="table" style='width:943px'></div>
     <script>
-      var eventSelect = $('#eventSelect').MPEventSelect();
-      var propSelect  = $('#propSelect').MPPropertySelect();
-      var dateSelect  = $('#dateSelect').MPDatepicker();
-      var eventGraph  = $('#graph').MPChart({chartType: 'line'});
-      var eventTable  = $('#table').MPTable({
-        showPercentages: true,
-        firstColHeader: 'Event'
-      });
 
-      var runQuery = function() {
-        var eventName = eventSelect.MPEventSelect('value'),
-            propName  = propSelect.MPPropertySelect('value'),
-            dateRange = dateSelect.MPDatepicker('value');
+    //get the script from $('#query') above
+    var script = $('#query').html();
+    
+    //initialize report graph
+    var stackedGraph = $('#graph').MPChart({chartType: 'bar', stacked: true, normalized: true});
 
-        if (eventName) {
-          MP.api.segment(eventName, propName, dateRange).done(function(results) {
-            eventGraph.MPChart('setData', results);
-            eventTable.MPTable('setData', results);
+    //initialize table
+    var eventTable = $('#table').MPTable({showPercentages: false, firstColHeader: 'Property'});
+    
+    //initialize date picker
+    var dateSelect = $('#dateSelect').MPDatepicker();
+
+    //make shortcut method to add options to MPSelect
+    var items = function() {return item_list = _.map(arguments, function(item) {return {label: String(item), value: item};})};
+
+    //initialize conversion window dropdown
+
+    //number of milliseconds in an hour
+    var msPerHour = 60 * 60 * 1000;
+
+    //make an object of labels and values to pass to MPSelect for the unit select dropdown
+    var timeUnitItems = {
+      items:[
+        {label:'hours',value: msPerHour},
+        {label:'days',value: msPerHour * 24}, // 24 hours in a day
+        {label:'weeks',value: msPerHour * 24 * 7}, // 24 hours in a day, 7 days in a week
+        {label:'months',value: msPerHour * 24 * 30} // 24 hours in a day, 30 days in a month
+        ]};
+    
+    //create time unit dropdown with options hours, days, weeks, months
+    var timeUnit = $('#unitSelect').MPSelect(timeUnitItems);
+
+    //set default to days
+    timeUnit.val(msPerHour * 24);
+
+    //create time value dropdown with options 1 through 30
+    var timeLength = $('#timeSelect').MPSelect({items: items(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30)});
+    
+    //set time value default to 1 unit
+    timeLength.val(1);
+
+    //create minimum sequence length dropdown
+    var minSequenceLength = $('#minLengthSelect').MPSelect({items: items(1,2,3,4,5,6,7,8,9,10)});
+    
+    //set minimum sequence length default to 2
+    minSequenceLength.val(2);
+
+    //create maximum sequence length dropdown
+    var maxSequenceLength = $('#maxLengthSelect').MPSelect({items: items(1,2,3,4,5,6,7,8,9,10)});
+    
+    //set maximum sequence length default to 6
+    maxSequenceLength.val(6);
+
+    //create max results dropdown with options 5, 10, 20, and 50
+    var maxResults = $('#numResultsSelect').MPSelect({items: items(5, 10, 20, 50)});
+
+    //set max results default to 5
+    maxResults.val(5);
+
+    //create start event dropdown
+    var startEvent = $('#startEventSelect').MPEventSelect();
+
+    //create finish event dropdown
+    var endEvent = $('#eventSelect').MPEventSelect();
+
+    //resize dropdowns
+    $('.select_button:not(#eventSelect > .select_button, #propSelect > .select_button, #startEventSelect > .select_button, #peoplePropSelect > .select_button)').addClass('small');
+    $('.select_menu:not(#eventSelect > .select_menu, #propSelect > .select_menu, #startEventSelect > .select_menu, #peoplePropSelect > .select_menu)').addClass('small');
+    $('#numResultsSelect, #minLengthSelect, #timeSelect, #unitSelect, #maxLengthSelect').css({'display': 'inline-block', 'max-width': '50px'})
+    
+
+    //this function runs the JQL query in $('#query') with parameters matching the values of the dropdowns
+    function runQuery() {
+      //resize dropdowns
+      $('.select_button:not(#eventSelect > .select_button, #propSelect > .select_button, #startEventSelect > .select_button, #peoplePropSelect > .select_button)').addClass('small');
+      $('.select_menu:not(#eventSelect > .select_menu, #propSelect > .select_menu, #startEventSelect > .select_menu, #peoplePropSelect > .select_menu)').addClass('small');
+      $('#numResultsSelect, #minLengthSelect, #timeSelect, #unitSelect, #maxLengthSelect').css({'display': 'inline-block', 'max-width': '50px'})
+
+      //grab parameter values from dropdowns
+      var params = {
+          'fromDate': dateSelect.MPDatepicker('value').from.toISOString().slice(0, -14), //transform the date so it's in YYYY-MM-DD format
+          'toDate': dateSelect.MPDatepicker('value').to.toISOString().slice(0, -14), //transform the date so it's in YYYY-MM-DD format
+          'minLength': minSequenceLength.MPSelect('value'),
+          'maxLength': maxSequenceLength.MPSelect('value'),
+          'conversionLength': timeLength.MPSelect('value') * timeUnit.MPSelect('value'), //this is the timeLength times the timeUnit
+          'numResults': maxResults.MPSelect('value'),
+          'startEvent': startEvent.MPEventSelect('value'),
+          'endEvent': endEvent.MPEventSelect('value')
+      };
+
+      //get the value of the property dropdown
+      var prop = property.MPSelect('value');
+
+      //if there's a value for prop, change the params object
+      if (prop) {
+
+        //figure out if it's a people property or event property by searching for "people" in the value
+        var propType = prop.indexOf('people') == -1? 'property' : 'peopleProp';
+
+        //set the appropriate param based on propType, chop "people" off the string if it's a people property
+        params[propType] = propType == 'peopleProp'? prop.substr(8, prop.length) : prop;
+      }
+
+      //run the query with params object
+      MP.api.jql(script, params).done(function(results) {
+        
+        //when JQL returns
+
+        //truncate results to top 12 property values by count
+        results = _.chain(results)
+               .sortBy(item => -1 * item.key.count)
+               .first(12)
+               .value();
+
+        //shortcut method to turn sequences into strings to display in the table
+        var sequenceMapper = function(sequence) {
+
+            //set this string to put in between each event in the sequence
+            var stringToPutBetweenEvents = ' -> ';
+
+            //initialize output to empty string
+            var seq = '';
+
+            //go through each item in the sequence and add it to the output without adding stringToPutBetweenEvents after the last event
+            _.each(sequence, function(item, index) {
+              seq = index != sequence.length - 1? seq + item + stringToPutBetweenEvents : seq + item; 
+            });
+
+            //return formatted string
+            return seq;
+          };
+
+        //these are just a bunch of transformations to use the graph and table.  they're useless if the graph/table formats are different
+        var res = [];
+        var graphRes = {};
+        var propVals = [];
+        var propTotals = {};
+        _.chain(results)
+         .pluck('key')
+         .each(function(item) {propTotals[item.property] = item.count});
+        _.each(results, function(item) {
+          propVals.push(item.key.property);
+          _.each(item.value, function(seq, index) {
+            // for each value, add the thing to the new object
+            var sequence = sequenceMapper(seq.sequence);
+            graphRes[sequence] = graphRes[sequence] || {};
+            graphRes[sequence][item.key.property] = {count:seq.count, percentage: seq.percentage};
+          });
+        });
+        _.each(_.keys(graphRes), function(flow) {
+          _.each(propVals, function(prop) {
+            graphRes[flow][prop] = graphRes[flow][prop]? graphRes[flow][prop] : {count: 0, percentage: 0};
+          });
+        });
+        stackedGraph.highcharts(getChartOptions(graphRes, propTotals));
+        var r = {};
+        if (results.length > 0) {
+          _.each(results, function(res_for_prop) {
+            var propval = res_for_prop.key.property + ' (' + res_for_prop.key.count + ')';
+            r[propval] = _(params.numResults).times(() => ('--'));
+            _.each(res_for_prop.value, function(seq, i) {
+              r[propval][i] = seq.count + ' (' + Math.round(seq.percentage * 10) / 10 + '%): ' + sequenceMapper(seq.sequence);
+            });
+            r[propval].unshift('');
+            delete r[propval][0];
           });
         }
-      };
-      eventSelect.on('change', function(e, eventName) {
-        propSelect.MPPropertySelect('setEvent', eventName);
-        $("#by").show();
-        runQuery();
+        eventTable.MPTable('setData', r);
       });
-      propSelect.on('change', runQuery);
-      dateSelect.on('change', runQuery);
+    }
+
+    //make variable for API request to grab top 255 event properties
+    var eventProperties = MP.api.query('/api/2.0/events/properties/top/', {limit: 255});
+
+    //make variable for API request to grab people properties
+    var peopleProperties = MP.api.query('api/2.0/engage/properties/top/');
+
+    //make promise array to asynchronously get results for the above two queries
+    var propertyPromises = [
+      eventProperties.done(function(eventResults) {
+        return eventResults;
+      }),
+      peopleProperties.done(function(peopleResults) {
+        return peopleResults;
+      })
+    ];
+
+    //execute propertyPromises array asynchronously, when results come back, run the code block
+    Promise.all(propertyPromises).then(function(properties) {
+
+      //get event properties, format them for MPSelect, then sort them alphabetically
+      var eventProps = properties[0];
+      eventProps = _.map(eventProps, (item, key) => ({label: key + ' (event)', value: key}));
+      eventProps = _.sortBy(eventProps, item => item.label);
+
+      //get people properties, format them for MPSelect, then sort them alphabetically
+      var peopleProps = properties[1].results;
+      peopleProps = _.map(peopleProps, (item, key) => ({label: key + ' (people)', value: '(people)' + key}));
+      peopleProps = _.sortBy(peopleProps, item => item.label);
+
+      //combine the above arrays, events first
+      var props = eventProps.concat(peopleProps);
+
+      //put a label at the beginning of the props array so that it shows by default in the dropdown
+      props.unshift({label: '-- Select a property --', value: undefined});
+
+      //create the property dropdown
+      property = $('#propSelect').MPSelect({items: props});
+
+      //create a listener on the dropdown that runs the query if the value changes
+      property.on('change', function() {runQuery();});
+
+      //since everything is now finished initializing, run the query (this is the first run)
+      runQuery();
+    });
+    
+    //create listeners on the dropdowns that run the query if the values change
+    dateSelect.on('change', function() {runQuery();});
+    timeLength.on('change', function(e, selection) {runQuery();});
+    timeUnit.on('change', function(e, selection) {runQuery();});
+    minSequenceLength.on('change', function(e, selection) {runQuery();});
+    maxSequenceLength.on('change', function(e, selection) {runQuery();});
+    maxResults.on('change', function(e, selection) {runQuery();});
+    startEvent.on('change', function(e, selection) {runQuery();});
+    endEvent.on('change', function(e, selection) {runQuery();});
+
+    function getChartOptions(res, propTotals) {
+      var props =[];
+      var propCounts = {};
+      var flows = [];
+      _.each(res, function(flow) {
+        _.each(_.keys(flow), function(prop) {
+          if (!_.contains(props, prop))
+            props.push(prop);
+        });
+      });
+      props = _.map(props, function(prop) {
+        var sum = 0;
+        _.each(res, function(item) {
+          sum += item[prop].count;
+        });
+        propCounts[prop] = sum;
+        return prop;
+      });
+      props = _.sortBy(props, function(prop) {
+        return -1 * propCounts[prop];
+      });
+      propMappings = propTotals;
+      _.each(res, function(flow, key) {
+        var fl = {};
+        fl.name = key;
+        fl.data = [];
+        _.each(props, function(prop) {
+          fl.data.push(flow[prop].percentage)
+        });
+        flows.push(fl);
+      });
+      chartOptions = {
+        colors: ['#53a3eb', '#32bbbd', '#a28ccb', '#da7b80', '#2bb5e2', '#e8bc66', '#d390b6', '#a0a7d6', '#e8cc75', '#f3ba41', '#7d92cd', '#24be86'],
+          chart: {
+              type: 'column',
+              normalized: true
+          },
+          title: {
+              text: 'Flow Frequency (in %) by Property',
+              style: {
+                fontSize: '20px',
+              color: '#747d94',
+              fontWeight: 'bold',
+              fontFamily: 'Helvetica'
+              }
+          },
+          xAxis: {
+              categories: props
+          },
+          yAxis: {
+              min: 0,
+              title: {text: ''},
+              endOnTick: false,
+              maxPadding: 0.0,
+              stackLabels: {enabled: false},
+              allowDecimals: false
+          },
+          legend: {enabled: false},
+          tooltip: {
+              formatter: function () {
+                return 'Property: ' + this.key + '<br/>' +
+                     'Sequence: ' + this.series.name + '<br/>' +
+                     'Percentage: ' + Math.round(this.y * 10) / 10 + '<br/>' +
+                     'Count: ' + Math.round(this.y * propMappings[this.key] * .01) + '<br/>';
+              }
+          },
+          plotOptions: {
+              column: {
+                  stacking: 'normal',
+                  dataLabels: {
+                      enabled: true,
+                      formatter: function(){
+                          if (this.point.shapeArgs.height < 13)
+                              return '';
+                          return Math.round(this.y * 10) / 10 + '%';
+                      },
+                      color: (Highcharts.theme && Highcharts.theme.dataLabelsColor) || 'white'
+                  }
+              },
+              series: {pointWidth : 40}
+          },
+          series: flows
+      };
+      return chartOptions;
+    }
     </script>
   </body>
 </html>
